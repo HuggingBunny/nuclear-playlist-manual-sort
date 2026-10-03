@@ -41,7 +41,7 @@ nuclear-playlist-manual-sort/
 Run the automated installer script:
 
 ```bash
-cd /home/chad/Work/nuclear-playlist-manual-sort
+cd nuclear-playlist-manual-sort
 ./install.sh
 ```
 
