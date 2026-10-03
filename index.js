@@ -31,6 +31,7 @@ let rafId = null;
 const STYLE_ID = 'nuclear-playlist-manual-sort-styles';
 const STORAGE_KEY_ORDER = 'nuclear_playlist_manual_order';
 const STORAGE_KEY_MODE = 'nuclear_playlist_sort_mode';
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Injects required stylesheet for manual drag-and-drop visuals.
@@ -132,7 +133,7 @@ function removeStyles() {
  * Updates internal maps of playlist IDs and titles.
  */
 function updatePlaylistIndexCache(index) {
-  if (!Array.isArray(index)) return;
+  if (!Array.isArray(index) || index.length === 0) return;
   playlistIndex = index;
   playlistTitleToIdMap.clear();
   playlistIdToEntryMap.clear();
@@ -202,24 +203,38 @@ async function persistSortMode(mode) {
 }
 
 /**
- * Resolves the playlist ID for a given card DOM node with caching.
+ * Resolves the playlist ID for a given card DOM node with zero-failure fallbacks.
  */
 function getPlaylistIdFromCard(cardEl) {
   if (!cardEl) return null;
   if (cardEl._nuclearPlaylistId) return cardEl._nuclearPlaylistId;
-  if (cardEl.dataset.playlistId && playlistIdToEntryMap.has(cardEl.dataset.playlistId)) {
+
+  // 1. Check data-playlist-id attribute
+  if (cardEl.dataset.playlistId) {
     cardEl._nuclearPlaylistId = cardEl.dataset.playlistId;
-    return cardEl._nuclearPlaylistId;
+    return cardEl.dataset.playlistId;
   }
 
-  // 1. Deep traverse React Fiber hierarchy to find key
+  // 2. React Fiber inspection for UUID key or props
   for (const prop in cardEl) {
-    if (prop.startsWith('__reactFiber$')) {
+    if (prop.startsWith('__reactFiber$') || prop.startsWith('__reactInternalInstance$')) {
       let cur = cardEl[prop];
       let depth = 0;
-      while (cur && depth < 12) {
-        if (cur.key && playlistIdToEntryMap.has(String(cur.key))) {
+      while (cur && depth < 16) {
+        if (cur.key && UUID_REGEX.test(String(cur.key))) {
           const id = String(cur.key);
+          cardEl._nuclearPlaylistId = id;
+          cardEl.dataset.playlistId = id;
+          return id;
+        }
+        if (cur.memoizedProps?.playlist?.id) {
+          const id = String(cur.memoizedProps.playlist.id);
+          cardEl._nuclearPlaylistId = id;
+          cardEl.dataset.playlistId = id;
+          return id;
+        }
+        if (cur.memoizedProps?.id && UUID_REGEX.test(String(cur.memoizedProps.id))) {
+          const id = String(cur.memoizedProps.id);
           cardEl._nuclearPlaylistId = id;
           cardEl.dataset.playlistId = id;
           return id;
@@ -230,11 +245,18 @@ function getPlaylistIdFromCard(cardEl) {
     }
   }
 
-  // 2. Fallback: match by title text in card
+  // 3. Match by playlist title
   const titleEl = cardEl.querySelector('[data-testid="card-title"]');
   const title = titleEl?.textContent?.trim();
-  if (title && playlistTitleToIdMap.has(title)) {
-    const id = playlistTitleToIdMap.get(title);
+  if (title) {
+    if (playlistTitleToIdMap.has(title)) {
+      const id = playlistTitleToIdMap.get(title);
+      cardEl._nuclearPlaylistId = id;
+      cardEl.dataset.playlistId = id;
+      return id;
+    }
+    // Fallback: title itself as deterministic key
+    const id = `title:${title}`;
     cardEl._nuclearPlaylistId = id;
     cardEl.dataset.playlistId = id;
     return id;
@@ -287,7 +309,7 @@ function clearDropIndicators() {
 }
 
 /**
- * ULTRA-FAST 60FPS POINTER DRAG CONTROLLER
+ * 60FPS WINDOW-LEVEL POINTER DRAG CONTROLLER
  */
 function handleCardPointerDown(e) {
   if (currentSortMode !== 'manual') return;
@@ -299,13 +321,6 @@ function handleCardPointerDown(e) {
 
   const grid = card.closest('[role="grid"]') || card.parentElement;
   if (!grid) return;
-
-  const cards = Array.from(grid.querySelectorAll('[data-testid="card"]'));
-  const cardItems = cards.map(c => ({
-    el: c,
-    id: getPlaylistIdFromCard(c),
-    rect: c.getBoundingClientRect()
-  })).filter(c => c.id);
 
   const rect = card.getBoundingClientRect();
 
@@ -323,18 +338,16 @@ function handleCardPointerDown(e) {
     cardHeight: rect.height,
     isDragging: false,
     ghostEl: null,
-    pointerId: e.pointerId,
-    cardItems,
-    targetItem: null,
+    targetCard: null,
     isAfter: false
   };
 
-  card.addEventListener('pointermove', handleCardPointerMove);
-  card.addEventListener('pointerup', handleCardPointerUp);
-  card.addEventListener('pointercancel', handleCardPointerUp);
+  window.addEventListener('pointermove', handleWindowPointerMove, { capture: true, passive: false });
+  window.addEventListener('pointerup', handleWindowPointerUp, { capture: true, passive: false });
+  window.addEventListener('pointercancel', handleWindowPointerUp, { capture: true, passive: false });
 }
 
-function handleCardPointerMove(e) {
+function handleWindowPointerMove(e) {
   if (!pointerDragState) return;
 
   pointerDragState.currentX = e.clientX;
@@ -343,25 +356,27 @@ function handleCardPointerMove(e) {
   const dx = e.clientX - pointerDragState.startX;
   const dy = e.clientY - pointerDragState.startY;
 
-  if (!pointerDragState.isDragging && (dx * dx + dy * dy) > 25) {
-    pointerDragState.isDragging = true;
+  if (!pointerDragState.isDragging) {
+    // 4px drag activation threshold
+    if ((dx * dx + dy * dy) > 16) {
+      pointerDragState.isDragging = true;
+      pointerDragState.card.classList.add('is-dragging');
 
-    try {
-      pointerDragState.card.setPointerCapture(pointerDragState.pointerId);
-    } catch (_) {}
+      const ghost = pointerDragState.card.cloneNode(true);
+      ghost.id = 'manual-drag-ghost';
+      ghost.style.width = pointerDragState.cardWidth + 'px';
+      ghost.style.height = pointerDragState.cardHeight + 'px';
+      ghost.style.transform = `translate3d(${e.clientX - pointerDragState.offsetX}px, ${e.clientY - pointerDragState.offsetY}px, 0)`;
 
-    pointerDragState.card.classList.add('is-dragging');
+      document.body.appendChild(ghost);
+      pointerDragState.ghostEl = ghost;
 
-    const ghost = pointerDragState.card.cloneNode(true);
-    ghost.id = 'manual-drag-ghost';
-    ghost.style.width = pointerDragState.cardWidth + 'px';
-    ghost.style.height = pointerDragState.cardHeight + 'px';
-    ghost.style.transform = `translate3d(${e.clientX - pointerDragState.offsetX}px, ${e.clientY - pointerDragState.offsetY}px, 0)`;
+      startDragRaf();
+    }
+  }
 
-    document.body.appendChild(ghost);
-    pointerDragState.ghostEl = ghost;
-
-    startDragRaf();
+  if (pointerDragState.isDragging) {
+    e.preventDefault();
   }
 }
 
@@ -374,35 +389,33 @@ function startDragRaf() {
       return;
     }
 
-    const { ghostEl, currentX, currentY, offsetX, offsetY, cardItems, card } = pointerDragState;
+    const { ghostEl, currentX, currentY, offsetX, offsetY, card, grid } = pointerDragState;
 
     if (ghostEl) {
       ghostEl.style.transform = `translate3d(${currentX - offsetX}px, ${currentY - offsetY}px, 0)`;
     }
 
+    // Ghost has pointer-events: none, so elementFromPoint hits directly underneath
+    const under = document.elementFromPoint(currentX, currentY);
+    const targetCard = under?.closest?.('[data-testid="card"]');
+
     let bestTarget = null;
     let isAfter = false;
 
-    for (let i = 0; i < cardItems.length; i++) {
-      const item = cardItems[i];
-      if (item.el === card) continue;
-      const r = item.rect;
-
-      if (currentX >= r.left && currentX <= r.right && currentY >= r.top && currentY <= r.bottom) {
-        bestTarget = item;
-        isAfter = (currentX - r.left) > (r.width / 2);
-        break;
-      }
+    if (targetCard && targetCard !== card && grid.contains(targetCard)) {
+      bestTarget = targetCard;
+      const targetRect = targetCard.getBoundingClientRect();
+      isAfter = (currentX - targetRect.left) > (targetRect.width / 2);
     }
 
-    if (bestTarget !== pointerDragState.targetItem || isAfter !== pointerDragState.isAfter) {
+    if (bestTarget !== pointerDragState.targetCard || isAfter !== pointerDragState.isAfter) {
       clearDropIndicators();
-      pointerDragState.targetItem = bestTarget;
+      pointerDragState.targetCard = bestTarget;
       pointerDragState.isAfter = isAfter;
 
       if (bestTarget) {
-        bestTarget.el.classList.toggle('drag-over-after', isAfter);
-        bestTarget.el.classList.toggle('drag-over-before', !isAfter);
+        bestTarget.classList.toggle('drag-over-after', isAfter);
+        bestTarget.classList.toggle('drag-over-before', !isAfter);
       }
     }
 
@@ -412,7 +425,7 @@ function startDragRaf() {
   rafId = requestAnimationFrame(update);
 }
 
-function handleCardPointerUp(e) {
+function handleWindowPointerUp(e) {
   if (!pointerDragState) return;
 
   if (rafId) {
@@ -420,15 +433,11 @@ function handleCardPointerUp(e) {
     rafId = null;
   }
 
-  const { card, playlistId, isDragging, ghostEl, pointerId, targetItem, isAfter, grid } = pointerDragState;
+  window.removeEventListener('pointermove', handleWindowPointerMove, { capture: true });
+  window.removeEventListener('pointerup', handleWindowPointerUp, { capture: true });
+  window.removeEventListener('pointercancel', handleWindowPointerUp, { capture: true });
 
-  try {
-    card.releasePointerCapture(pointerId);
-  } catch (_) {}
-
-  card.removeEventListener('pointermove', handleCardPointerMove);
-  card.removeEventListener('pointerup', handleCardPointerUp);
-  card.removeEventListener('pointercancel', handleCardPointerUp);
+  const { card, isDragging, ghostEl, targetCard, isAfter, grid } = pointerDragState;
 
   if (ghostEl && ghostEl.parentNode) {
     ghostEl.parentNode.removeChild(ghostEl);
@@ -440,8 +449,8 @@ function handleCardPointerUp(e) {
   if (isDragging) {
     suppressClicksUntil = Date.now() + 400;
 
-    if (targetItem && targetItem.id && targetItem.id !== playlistId) {
-      executeReorder(playlistId, targetItem.id, isAfter, grid, card, targetItem.el);
+    if (targetCard && targetCard !== card) {
+      executeReorder(card, targetCard, isAfter, grid);
     }
   }
 
@@ -449,37 +458,31 @@ function handleCardPointerUp(e) {
 }
 
 /**
- * Reorders array in memory, updates DOM instantly, and persists.
+ * Reorders DOM elements immediately, captures full grid order, and persists.
  */
-function executeReorder(sourceId, targetId, isAfter, grid, sourceEl, targetEl) {
-  const fromIdx = manualPlaylistOrder.indexOf(sourceId);
-  const toIdx = manualPlaylistOrder.indexOf(targetId);
-
-  if (fromIdx === -1 || toIdx === -1 || fromIdx === toIdx) return;
-
-  manualPlaylistOrder.splice(fromIdx, 1);
-  let insertIdx = manualPlaylistOrder.indexOf(targetId);
-  if (isAfter) {
-    insertIdx += 1;
-  }
-  manualPlaylistOrder.splice(insertIdx, 0, sourceId);
-
-  persistManualOrder();
-
+function executeReorder(sourceCard, targetCard, isAfter, grid) {
   isReorderingDom = true;
   try {
     if (isAfter) {
-      targetEl.after(sourceEl);
+      targetCard.after(sourceCard);
     } else {
-      targetEl.before(sourceEl);
+      targetCard.before(sourceCard);
     }
-    api?.Logger?.info?.(`[PlaylistManualSort] Live drop reorder complete (${manualPlaylistOrder.length} playlists)`);
+
+    const allCards = Array.from(grid.querySelectorAll('[data-testid="card"]'));
+    const newOrder = allCards.map(c => getPlaylistIdFromCard(c)).filter(Boolean);
+
+    if (newOrder.length > 0) {
+      manualPlaylistOrder = newOrder;
+      persistManualOrder();
+      api?.Logger?.info?.(`[PlaylistManualSort] Live drop reorder complete (${newOrder.length} playlists)`);
+    }
   } catch (err) {
     api?.Logger?.warn?.('[PlaylistManualSort] DOM reorder error: ' + err);
   } finally {
     setTimeout(() => {
       isReorderingDom = false;
-    }, 120);
+    }, 100);
   }
 }
 
@@ -535,36 +538,40 @@ function applyManualOrderToDom(grid) {
     }
   }
 
-  let alreadyOrdered = true;
+  // Check if DOM already matches manualPlaylistOrder
+  let inOrder = true;
+  let manualMatches = 0;
   for (let i = 0; i < cards.length && i < manualPlaylistOrder.length; i++) {
     const id = getPlaylistIdFromCard(cards[i]);
-    if (id && id !== manualPlaylistOrder[i]) {
-      alreadyOrdered = false;
+    if (id === manualPlaylistOrder[i]) {
+      manualMatches++;
+    } else {
+      inOrder = false;
       break;
     }
   }
 
-  if (alreadyOrdered) return;
+  if (inOrder && manualMatches > 0) return;
 
   isReorderingDom = true;
   try {
     const fragment = document.createDocumentFragment();
-    const appendedIds = new Set();
+    const appendedCards = new Set();
 
     for (let i = 0; i < manualPlaylistOrder.length; i++) {
       const id = manualPlaylistOrder[i];
       const card = cardMap.get(id);
-      if (card) {
+      if (card && !appendedCards.has(card)) {
         fragment.appendChild(card);
-        appendedIds.add(id);
+        appendedCards.add(card);
       }
     }
 
     for (let i = 0; i < cards.length; i++) {
       const card = cards[i];
-      const id = getPlaylistIdFromCard(card);
-      if (id && !appendedIds.has(id)) {
+      if (!appendedCards.has(card)) {
         fragment.appendChild(card);
+        appendedCards.add(card);
       }
     }
 
@@ -716,6 +723,20 @@ function triggerSync() {
 }
 
 /**
+ * Refreshes playlists index from Nuclear API if not yet cached.
+ */
+async function refreshPlaylistIndex() {
+  try {
+    if (api?.Playlists?.getIndex) {
+      const index = await api.Playlists.getIndex();
+      if (Array.isArray(index) && index.length > 0) {
+        updatePlaylistIndexCache(index);
+      }
+    }
+  } catch (_) {}
+}
+
+/**
  * Main DOM synchronization routine for the Playlists view.
  */
 function syncPlaylistsView() {
@@ -726,6 +747,10 @@ function syncPlaylistsView() {
       gridObserver = null;
     }
     return;
+  }
+
+  if (playlistIndex.length === 0) {
+    refreshPlaylistIndex();
   }
 
   const sortContainer = playlistsView.querySelector('[data-testid="sort-playlists"]');
@@ -812,16 +837,16 @@ const plugin = {
       }
     } catch (_) {}
 
+    refreshPlaylistIndex();
+
     try {
-      if (api.Playlists?.getIndex) {
-        const initialIndex = await api.Playlists.getIndex();
-        updatePlaylistIndexCache(initialIndex);
-      }
       if (api.Playlists?.subscribe) {
         unsubscribers.push(
           api.Playlists.subscribe((index) => {
-            updatePlaylistIndexCache(index);
-            triggerSync();
+            if (Array.isArray(index)) {
+              updatePlaylistIndexCache(index);
+              triggerSync();
+            }
           })
         );
       }
@@ -855,7 +880,7 @@ const plugin = {
       bodyPortalObserver.observe(document.body, { childList: true });
     }
 
-    // 3. Lightweight view polling while on playlists view (ensures button text and options are always locked)
+    // 3. Lightweight view polling while on playlists view
     syncInterval = setInterval(() => {
       const playlistsView = document.querySelector('[data-testid="playlists-view"]');
       if (playlistsView) {
@@ -870,7 +895,7 @@ const plugin = {
 
     syncPlaylistsView();
 
-    api.Logger?.info('[PlaylistManualSort] Playlist Manual Sort plugin active (full portal integration)');
+    api.Logger?.info('[PlaylistManualSort] Playlist Manual Sort plugin active (robust window drag controller)');
   },
 
   async onDisable() {
