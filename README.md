@@ -5,6 +5,8 @@
 
 A high-performance extension for **Nuclear Music Player** that introduces a dedicated **Manual** playlist sorting option with drag-and-drop playlist card reorganization.
 
+![Playlist Manual Sort in Nuclear Music Player](./docs/screenshot.png)
+
 ---
 
 ## Features
