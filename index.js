@@ -20,6 +20,7 @@ let domObserver = null;
 let syncInterval = null;
 let styleEl = null;
 
+let pointerDragState = null;
 let draggedCard = null;
 let suppressClicksUntil = 0;
 let isReorderingDom = false;
@@ -42,7 +43,7 @@ function injectStyles() {
       position: relative !important;
       transition: transform 0.18s cubic-bezier(0.2, 0, 0, 1), box-shadow 0.18s ease, opacity 0.18s ease;
       user-select: none !important;
-      -webkit-user-drag: element;
+      touch-action: none !important;
     }
 
     .manual-sort-active [data-testid="card"]:active {
@@ -50,7 +51,7 @@ function injectStyles() {
     }
 
     .manual-sort-active [data-testid="card"].is-dragging {
-      opacity: 0.4 !important;
+      opacity: 0.35 !important;
       transform: scale(0.96) !important;
       box-shadow: 0 0 0 2px var(--primary-9, #fc83d3), 0 12px 28px rgba(0, 0, 0, 0.6) !important;
     }
@@ -92,6 +93,18 @@ function injectStyles() {
       color: #ffffff;
     }
 
+    #manual-drag-ghost {
+      pointer-events: none !important;
+      position: fixed !important;
+      z-index: 99999 !important;
+      opacity: 0.88 !important;
+      transform: scale(1.03) rotate(1.2deg) !important;
+      box-shadow: 0 16px 36px rgba(0, 0, 0, 0.65), 0 0 0 2px var(--primary-9, #fc83d3) !important;
+      transition: none !important;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+
     [data-manual-sort-option] {
       transition: background 0.12s ease;
     }
@@ -131,11 +144,15 @@ function updatePlaylistIndexCache(index) {
     }
   }
 
-  // Prune any deleted playlist IDs from manualPlaylistOrder
+  // Prune deleted playlist IDs from manualPlaylistOrder
   const validIds = new Set(playlistIdToEntryMap.keys());
   let changed = false;
 
-  manualPlaylistOrder = manualPlaylistOrder.filter(id => validIds.has(id));
+  const filteredOrder = manualPlaylistOrder.filter(id => validIds.has(id));
+  if (filteredOrder.length !== manualPlaylistOrder.length) {
+    manualPlaylistOrder = filteredOrder;
+    changed = true;
+  }
 
   // Append any newly created/imported playlists not yet in manual order
   for (const entry of index) {
@@ -160,6 +177,7 @@ async function persistManualOrder() {
     if (api?.Settings?.set) {
       await api.Settings.set('manualOrder', raw);
     }
+    api?.Logger?.info?.(`[PlaylistManualSort] Persisted manual order (${manualPlaylistOrder.length} playlists)`);
   } catch (err) {
     api?.Logger?.warn?.('[PlaylistManualSort] Failed to persist manual order: ' + err);
   }
@@ -175,29 +193,34 @@ async function persistSortMode(mode) {
     if (api?.Settings?.set) {
       await api.Settings.set('sortBy', mode);
     }
+    api?.Logger?.info?.(`[PlaylistManualSort] Switched sort mode to: ${mode}`);
   } catch (err) {
     api?.Logger?.warn?.('[PlaylistManualSort] Failed to persist sort mode: ' + err);
   }
 }
 
 /**
- * Resolves the playlist ID for a given card DOM node.
+ * Resolves the playlist ID for a given card DOM node with deep Fiber traversal.
  */
 function getPlaylistIdFromCard(cardEl) {
   if (!cardEl) return null;
-  if (cardEl.dataset.playlistId) return cardEl.dataset.playlistId;
+  if (cardEl.dataset.playlistId && playlistIdToEntryMap.has(cardEl.dataset.playlistId)) {
+    return cardEl.dataset.playlistId;
+  }
 
-  // 1. Inspect React Fiber key on DOM node
+  // 1. Deep traverse React Fiber hierarchy to find key
   for (const prop in cardEl) {
     if (prop.startsWith('__reactFiber$')) {
-      const fiber = cardEl[prop];
-      if (fiber?.key && playlistIdToEntryMap.has(String(fiber.key))) {
-        cardEl.dataset.playlistId = String(fiber.key);
-        return String(fiber.key);
-      }
-      if (fiber?.return?.key && playlistIdToEntryMap.has(String(fiber.return.key))) {
-        cardEl.dataset.playlistId = String(fiber.return.key);
-        return String(fiber.return.key);
+      let cur = cardEl[prop];
+      let depth = 0;
+      while (cur && depth < 12) {
+        if (cur.key && playlistIdToEntryMap.has(String(cur.key))) {
+          const id = String(cur.key);
+          cardEl.dataset.playlistId = id;
+          return id;
+        }
+        cur = cur.return;
+        depth++;
       }
     }
   }
@@ -234,7 +257,6 @@ function ensureDragHandle(cardEl) {
     </svg>
   `;
 
-  // Attach inside card's relative aspect-square image container if present, else card
   const imgBox = cardEl.querySelector('.aspect-square') || cardEl;
   imgBox.appendChild(handle);
 }
@@ -250,7 +272,176 @@ function removeDragHandle(cardEl) {
 }
 
 /**
- * Drag and Drop Event Listeners for Playlist Cards
+ * Cleans up any leftover drop indicators across cards.
+ */
+function clearDropIndicators() {
+  document.querySelectorAll('.drag-over-before, .drag-over-after').forEach(el => {
+    el.classList.remove('drag-over-before', 'drag-over-after');
+  });
+}
+
+/**
+ * POINTER EVENTS DRAG CONTROLLER
+ * Cross-platform, immune to Wayland/WebKitGTK DND drops.
+ */
+function handleCardPointerDown(e) {
+  if (currentSortMode !== 'manual') return;
+  if (e.button !== 0) return; // Only left click
+
+  const card = e.currentTarget;
+  const playlistId = getPlaylistIdFromCard(card);
+  if (!playlistId) return;
+
+  pointerDragState = {
+    card,
+    playlistId,
+    startX: e.clientX,
+    startY: e.clientY,
+    isDragging: false,
+    ghostEl: null,
+    pointerId: e.pointerId
+  };
+
+  card.addEventListener('pointermove', handleCardPointerMove);
+  card.addEventListener('pointerup', handleCardPointerUp);
+  card.addEventListener('pointercancel', handleCardPointerUp);
+}
+
+function handleCardPointerMove(e) {
+  if (!pointerDragState) return;
+
+  const dx = e.clientX - pointerDragState.startX;
+  const dy = e.clientY - pointerDragState.startY;
+  const dist = Math.sqrt(dx * dx + dy * dy);
+
+  if (!pointerDragState.isDragging && dist > 5) {
+    pointerDragState.isDragging = true;
+    draggedCard = pointerDragState.card;
+
+    try {
+      pointerDragState.card.setPointerCapture(pointerDragState.pointerId);
+    } catch (_) {}
+
+    pointerDragState.card.classList.add('is-dragging');
+
+    // Create floating clone
+    const rect = pointerDragState.card.getBoundingClientRect();
+    const ghost = pointerDragState.card.cloneNode(true);
+    ghost.id = 'manual-drag-ghost';
+    ghost.style.width = rect.width + 'px';
+    ghost.style.height = rect.height + 'px';
+    ghost.style.left = (e.clientX - (e.clientX - rect.left)) + 'px';
+    ghost.style.top = (e.clientY - (e.clientY - rect.top)) + 'px';
+
+    document.body.appendChild(ghost);
+    pointerDragState.ghostEl = ghost;
+    pointerDragState.offsetX = e.clientX - rect.left;
+    pointerDragState.offsetY = e.clientY - rect.top;
+
+    api?.Logger?.debug?.(`[PlaylistManualSort] Pointer drag started for: ${pointerDragState.playlistId}`);
+  }
+
+  if (pointerDragState.isDragging) {
+    if (pointerDragState.ghostEl) {
+      pointerDragState.ghostEl.style.left = (e.clientX - (pointerDragState.offsetX || 30)) + 'px';
+      pointerDragState.ghostEl.style.top = (e.clientY - (pointerDragState.offsetY || 30)) + 'px';
+    }
+
+    // Hit-test element under pointer (temporarily hide ghost)
+    if (pointerDragState.ghostEl) pointerDragState.ghostEl.style.display = 'none';
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    if (pointerDragState.ghostEl) pointerDragState.ghostEl.style.display = '';
+
+    const targetCard = under?.closest?.('[data-testid="card"]');
+
+    clearDropIndicators();
+
+    if (targetCard && targetCard !== pointerDragState.card) {
+      const targetRect = targetCard.getBoundingClientRect();
+      const isAfter = (e.clientX - targetRect.left) > (targetRect.width / 2);
+      targetCard.classList.toggle('drag-over-after', isAfter);
+      targetCard.classList.toggle('drag-over-before', !isAfter);
+    }
+  }
+}
+
+function handleCardPointerUp(e) {
+  if (!pointerDragState) return;
+
+  const { card, playlistId, isDragging, ghostEl, pointerId } = pointerDragState;
+
+  try {
+    card.releasePointerCapture(pointerId);
+  } catch (_) {}
+
+  card.removeEventListener('pointermove', handleCardPointerMove);
+  card.removeEventListener('pointerup', handleCardPointerUp);
+  card.removeEventListener('pointercancel', handleCardPointerUp);
+
+  if (ghostEl && ghostEl.parentNode) {
+    ghostEl.parentNode.removeChild(ghostEl);
+  }
+
+  card.classList.remove('is-dragging');
+  draggedCard = null;
+
+  if (isDragging) {
+    suppressClicksUntil = Date.now() + 400;
+
+    // Find the drop target
+    const under = document.elementFromPoint(e.clientX, e.clientY);
+    const targetCard = under?.closest?.('[data-testid="card"]');
+
+    clearDropIndicators();
+
+    if (targetCard && targetCard !== card) {
+      const targetId = getPlaylistIdFromCard(targetCard);
+      const draggedId = playlistId;
+
+      if (targetId && draggedId && targetId !== draggedId) {
+        const targetRect = targetCard.getBoundingClientRect();
+        const isAfter = (e.clientX - targetRect.left) > (targetRect.width / 2);
+
+        executeCardReorder(card, targetCard, isAfter);
+      }
+    }
+  }
+
+  pointerDragState = null;
+}
+
+/**
+ * Reorders a card relative to targetCard and updates state atomically.
+ */
+function executeCardReorder(sourceCard, targetCard, isAfter) {
+  isReorderingDom = true;
+  try {
+    if (isAfter) {
+      targetCard.after(sourceCard);
+    } else {
+      targetCard.before(sourceCard);
+    }
+
+    const grid = targetCard.closest('[role="grid"]') || targetCard.parentElement;
+    if (grid) {
+      const allCards = Array.from(grid.querySelectorAll('[data-testid="card"]'));
+      const newOrder = allCards.map(c => getPlaylistIdFromCard(c)).filter(Boolean);
+
+      if (newOrder.length > 0) {
+        manualPlaylistOrder = newOrder;
+        persistManualOrder();
+        api?.Logger?.info?.(`[PlaylistManualSort] Successfully reordered playlists (${newOrder.length} total)`);
+      }
+    }
+  } catch (err) {
+    api?.Logger?.warn?.('[PlaylistManualSort] Reorder error: ' + err);
+  } finally {
+    isReorderingDom = false;
+  }
+}
+
+/**
+ * HTML5 DRAG & DROP CONTROLLER (Parallel fallback)
  */
 function handleCardDragStart(e) {
   if (currentSortMode !== 'manual') return;
@@ -263,24 +454,24 @@ function handleCardDragStart(e) {
   e.dataTransfer.effectAllowed = 'move';
   e.dataTransfer.setData('text/plain', playlistId || '');
 
-  // Add subtle drag ghost transparency
   if (e.dataTransfer.setDragImage) {
-    e.dataTransfer.setDragImage(card, e.offsetX || 40, e.offsetY || 40);
+    e.dataTransfer.setDragImage(card, 30, 30);
   }
 }
 
 function handleCardDragOver(e) {
-  if (currentSortMode !== 'manual' || !draggedCard) return;
+  if (currentSortMode !== 'manual') return;
 
   e.preventDefault();
   e.dataTransfer.dropEffect = 'move';
 
   const targetCard = e.currentTarget;
-  if (targetCard === draggedCard) return;
+  if (!draggedCard || targetCard === draggedCard) return;
 
   const rect = targetCard.getBoundingClientRect();
   const isAfter = (e.clientX - rect.left) > (rect.width / 2);
 
+  clearDropIndicators();
   targetCard.classList.toggle('drag-over-after', isAfter);
   targetCard.classList.toggle('drag-over-before', !isAfter);
 }
@@ -291,51 +482,30 @@ function handleCardDragLeave(e) {
 }
 
 function handleCardDrop(e) {
-  if (currentSortMode !== 'manual' || !draggedCard) return;
+  if (currentSortMode !== 'manual') return;
 
   e.preventDefault();
   e.stopPropagation();
 
   const targetCard = e.currentTarget;
-  targetCard.classList.remove('drag-over-before', 'drag-over-after');
+  clearDropIndicators();
 
-  if (targetCard !== draggedCard) {
+  if (draggedCard && targetCard && targetCard !== draggedCard) {
     const rect = targetCard.getBoundingClientRect();
     const isAfter = (e.clientX - rect.left) > (rect.width / 2);
 
-    if (isAfter) {
-      targetCard.after(draggedCard);
-    } else {
-      targetCard.before(draggedCard);
-    }
-
-    // Extract new DOM order and save
-    const grid = targetCard.closest('[role="grid"]') || targetCard.parentElement;
-    if (grid) {
-      const cards = Array.from(grid.querySelectorAll('[data-testid="card"]'));
-      const newOrder = cards.map(c => getPlaylistIdFromCard(c)).filter(Boolean);
-
-      if (newOrder.length > 0) {
-        manualPlaylistOrder = newOrder;
-        persistManualOrder();
-        api?.Logger?.info?.(`[PlaylistManualSort] Updated manual order (${newOrder.length} playlists)`);
-      }
-    }
+    executeCardReorder(draggedCard, targetCard, isAfter);
   }
 
-  suppressClicksUntil = Date.now() + 300;
+  suppressClicksUntil = Date.now() + 400;
 }
 
 function handleCardDragEnd(e) {
   const card = e.currentTarget;
   card.classList.remove('is-dragging');
   draggedCard = null;
-
-  document.querySelectorAll('.drag-over-before, .drag-over-after').forEach(el => {
-    el.classList.remove('drag-over-before', 'drag-over-after');
-  });
-
-  suppressClicksUntil = Date.now() + 300;
+  clearDropIndicators();
+  suppressClicksUntil = Date.now() + 400;
 }
 
 function handleCardClickCapture(e) {
@@ -348,27 +518,35 @@ function handleCardClickCapture(e) {
 }
 
 /**
- * Attaches drag-and-drop listeners to a card.
+ * Attaches drag listeners (both Pointer and HTML5) to a card.
  */
 function attachDragListeners(cardEl) {
   if (cardEl.__manualSortAttached) return;
   cardEl.__manualSortAttached = true;
 
+  // Pointer drag listeners (primary)
+  cardEl.addEventListener('pointerdown', handleCardPointerDown);
+
+  // HTML5 drag listeners (fallback)
   cardEl.setAttribute('draggable', 'true');
   cardEl.addEventListener('dragstart', handleCardDragStart);
   cardEl.addEventListener('dragover', handleCardDragOver);
   cardEl.addEventListener('dragleave', handleCardDragLeave);
   cardEl.addEventListener('drop', handleCardDrop);
   cardEl.addEventListener('dragend', handleCardDragEnd);
+
+  // Click guard
   cardEl.addEventListener('click', handleCardClickCapture, true);
 }
 
 /**
- * Detaches drag-and-drop listeners from a card.
+ * Detaches drag listeners from a card.
  */
 function detachDragListeners(cardEl) {
   if (!cardEl.__manualSortAttached) return;
   cardEl.__manualSortAttached = false;
+
+  cardEl.removeEventListener('pointerdown', handleCardPointerDown);
 
   cardEl.removeAttribute('draggable');
   cardEl.classList.remove('is-dragging', 'drag-over-before', 'drag-over-after');
@@ -378,6 +556,7 @@ function detachDragListeners(cardEl) {
   cardEl.removeEventListener('drop', handleCardDrop);
   cardEl.removeEventListener('dragend', handleCardDragEnd);
   cardEl.removeEventListener('click', handleCardClickCapture, true);
+
   removeDragHandle(cardEl);
 }
 
@@ -502,18 +681,14 @@ function enhanceListboxMenu(listboxEl) {
 
     persistSortMode('manual');
 
-    // Update checkmark
     const check = manualOption.querySelector('.manual-check-icon');
     if (check) check.style.display = '';
 
-    // Update button text
     const sortContainer = document.querySelector('[data-testid="sort-playlists"]');
     updateSortButtonLabel(sortContainer);
 
-    // Close the listbox menu by clicking outside or pressing Escape
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 
-    // Re-apply DOM layout
     syncPlaylistsView();
   });
 
@@ -540,7 +715,6 @@ function syncPlaylistsView() {
   if (sortContainer) {
     updateSortButtonLabel(sortContainer);
 
-    // Watch for listbox menu opening
     const listbox = document.querySelector('ul[role="listbox"], ul[id$="-listbox"]');
     if (listbox) {
       enhanceListboxMenu(listbox);
@@ -699,6 +873,7 @@ const plugin = {
 
     api = null;
     draggedCard = null;
+    pointerDragState = null;
   }
 };
 
