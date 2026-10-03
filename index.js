@@ -18,6 +18,8 @@ const playlistIdToEntryMap = new Map();
 let unsubscribers = [];
 let workspaceObserver = null;
 let gridObserver = null;
+let bodyPortalObserver = null;
+let syncInterval = null;
 let syncDebounceTimer = null;
 let styleEl = null;
 
@@ -286,7 +288,6 @@ function clearDropIndicators() {
 
 /**
  * ULTRA-FAST 60FPS POINTER DRAG CONTROLLER
- * Zero layout thrashing, pure numerical coordinate matching, rAF updates.
  */
 function handleCardPointerDown(e) {
   if (currentSortMode !== 'manual') return;
@@ -299,7 +300,6 @@ function handleCardPointerDown(e) {
   const grid = card.closest('[role="grid"]') || card.parentElement;
   if (!grid) return;
 
-  // Cache geometry of all cards ONCE at drag start (0 DOM queries during drag)
   const cards = Array.from(grid.querySelectorAll('[data-testid="card"]'));
   const cardItems = cards.map(c => ({
     el: c,
@@ -352,7 +352,6 @@ function handleCardPointerMove(e) {
 
     pointerDragState.card.classList.add('is-dragging');
 
-    // Create featherweight ghost
     const ghost = pointerDragState.card.cloneNode(true);
     ghost.id = 'manual-drag-ghost';
     ghost.style.width = pointerDragState.cardWidth + 'px';
@@ -362,7 +361,6 @@ function handleCardPointerMove(e) {
     document.body.appendChild(ghost);
     pointerDragState.ghostEl = ghost;
 
-    // Start rAF loop
     startDragRaf();
   }
 }
@@ -378,12 +376,10 @@ function startDragRaf() {
 
     const { ghostEl, currentX, currentY, offsetX, offsetY, cardItems, card } = pointerDragState;
 
-    // 1. Move ghost smoothly via GPU translate3d
     if (ghostEl) {
       ghostEl.style.transform = `translate3d(${currentX - offsetX}px, ${currentY - offsetY}px, 0)`;
     }
 
-    // 2. Numerical hit test against cached cardItems (instant, 0 layout reflows)
     let bestTarget = null;
     let isAfter = false;
 
@@ -461,7 +457,6 @@ function executeReorder(sourceId, targetId, isAfter, grid, sourceEl, targetEl) {
 
   if (fromIdx === -1 || toIdx === -1 || fromIdx === toIdx) return;
 
-  // 1. Update in-memory order array
   manualPlaylistOrder.splice(fromIdx, 1);
   let insertIdx = manualPlaylistOrder.indexOf(targetId);
   if (isAfter) {
@@ -469,10 +464,8 @@ function executeReorder(sourceId, targetId, isAfter, grid, sourceEl, targetEl) {
   }
   manualPlaylistOrder.splice(insertIdx, 0, sourceId);
 
-  // 2. Persist synchronously to localStorage & asynchronously to api.Settings
   persistManualOrder();
 
-  // 3. Move in DOM under atomic lock
   isReorderingDom = true;
   try {
     if (isAfter) {
@@ -484,10 +477,9 @@ function executeReorder(sourceId, targetId, isAfter, grid, sourceEl, targetEl) {
   } catch (err) {
     api?.Logger?.warn?.('[PlaylistManualSort] DOM reorder error: ' + err);
   } finally {
-    // Keep lock active for 100ms to ignore immediate mutation observer echoes
     setTimeout(() => {
       isReorderingDom = false;
-    }, 100);
+    }, 120);
   }
 }
 
@@ -543,7 +535,6 @@ function applyManualOrderToDom(grid) {
     }
   }
 
-  // Check if DOM already matches
   let alreadyOrdered = true;
   for (let i = 0; i < cards.length && i < manualPlaylistOrder.length; i++) {
     const id = getPlaylistIdFromCard(cards[i]);
@@ -569,7 +560,6 @@ function applyManualOrderToDom(grid) {
       }
     }
 
-    // Append any extra cards
     for (let i = 0; i < cards.length; i++) {
       const card = cards[i];
       const id = getPlaylistIdFromCard(card);
@@ -582,7 +572,18 @@ function applyManualOrderToDom(grid) {
   } finally {
     setTimeout(() => {
       isReorderingDom = false;
-    }, 50);
+    }, 60);
+  }
+}
+
+/**
+ * Enforces the "Manual" text on the button label.
+ */
+function enforceManualButtonLabel(button) {
+  if (!button) return;
+  const labelSpan = button.querySelector('span.truncate') || button.querySelector('span');
+  if (labelSpan && labelSpan.textContent !== 'Manual') {
+    labelSpan.textContent = 'Manual';
   }
 }
 
@@ -595,11 +596,46 @@ function updateSortButtonLabel(sortContainer) {
   if (!button) return;
 
   if (currentSortMode === 'manual') {
-    const labelSpan = button.querySelector('span.truncate') || button.querySelector('span');
-    if (labelSpan && labelSpan.textContent !== 'Manual') {
-      labelSpan.textContent = 'Manual';
+    enforceManualButtonLabel(button);
+
+    // Attach label mutation observer so React can't overwrite it
+    if (!button._labelObserver && window.MutationObserver) {
+      button._labelObserver = new MutationObserver(() => {
+        if (currentSortMode === 'manual') {
+          enforceManualButtonLabel(button);
+        }
+      });
+      button._labelObserver.observe(button, { childList: true, subtree: true, characterData: true });
     }
   }
+}
+
+/**
+ * Checks all listboxes in DOM and injects the Manual option.
+ */
+function checkAndInjectListboxes() {
+  const listboxes = document.querySelectorAll('ul[role="listbox"], [role="listbox"]');
+  listboxes.forEach(enhanceListboxMenu);
+}
+
+/**
+ * Attaches direct click/open listener to sort button.
+ */
+function attachSortButtonListeners(sortContainer) {
+  const button = sortContainer.querySelector('button');
+  if (!button || button._manualSortListenerAttached) return;
+  button._manualSortListenerAttached = true;
+
+  const onOpen = () => {
+    checkAndInjectListboxes();
+    setTimeout(checkAndInjectListboxes, 0);
+    requestAnimationFrame(checkAndInjectListboxes);
+    setTimeout(checkAndInjectListboxes, 40);
+    setTimeout(checkAndInjectListboxes, 120);
+  };
+
+  button.addEventListener('pointerdown', onOpen);
+  button.addEventListener('click', onOpen);
 }
 
 /**
@@ -637,7 +673,7 @@ function enhanceListboxMenu(listboxEl) {
     });
   }
 
-  manualOption.addEventListener('mousedown', (e) => {
+  const selectManual = (e) => {
     e.preventDefault();
     e.stopPropagation();
 
@@ -647,12 +683,17 @@ function enhanceListboxMenu(listboxEl) {
     if (check) check.style.display = '';
 
     const sortContainer = document.querySelector('[data-testid="sort-playlists"]');
-    updateSortButtonLabel(sortContainer);
+    if (sortContainer) {
+      updateSortButtonLabel(sortContainer);
+    }
 
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
 
     triggerSync();
-  });
+  };
+
+  manualOption.addEventListener('pointerdown', selectManual);
+  manualOption.addEventListener('click', selectManual);
 
   const otherOptions = listboxEl.querySelectorAll('li:not([data-manual-sort-option])');
   otherOptions.forEach(opt => {
@@ -666,7 +707,7 @@ function enhanceListboxMenu(listboxEl) {
 }
 
 /**
- * Debounced sync trigger to prevent tight observer loops.
+ * Debounced sync trigger.
  */
 function triggerSync() {
   if (isReorderingDom) return;
@@ -690,17 +731,13 @@ function syncPlaylistsView() {
   const sortContainer = playlistsView.querySelector('[data-testid="sort-playlists"]');
   if (sortContainer) {
     updateSortButtonLabel(sortContainer);
-
-    const listbox = document.querySelector('ul[role="listbox"], ul[id$="-listbox"]');
-    if (listbox) {
-      enhanceListboxMenu(listbox);
-    }
+    attachSortButtonListeners(sortContainer);
+    checkAndInjectListboxes();
   }
 
   const grid = playlistsView.querySelector('[role="grid"]') || playlistsView.querySelector('.grid');
   if (!grid) return;
 
-  // Observe grid children directly (never deep subtree)
   if (!gridObserver && window.MutationObserver) {
     gridObserver = new MutationObserver(() => {
       triggerSync();
@@ -711,7 +748,6 @@ function syncPlaylistsView() {
   const cards = Array.from(grid.querySelectorAll('[data-testid="card"]'));
   if (cards.length === 0) return;
 
-  // Tag cards
   for (let i = 0; i < cards.length; i++) {
     getPlaylistIdFromCard(cards[i]);
   }
@@ -739,7 +775,6 @@ const plugin = {
 
     injectStyles();
 
-    // Register settings
     try {
       if (api.Settings?.register) {
         await api.Settings.register([
@@ -765,7 +800,6 @@ const plugin = {
       }
     } catch (_) {}
 
-    // Load initial settings & local cache
     try {
       const savedMode = (await api.Settings?.get?.('sortBy')) || localStorage.getItem(STORAGE_KEY_MODE);
       if (savedMode) {
@@ -778,7 +812,6 @@ const plugin = {
       }
     } catch (_) {}
 
-    // Load initial playlist index and subscribe to changes
     try {
       if (api.Playlists?.getIndex) {
         const initialIndex = await api.Playlists.getIndex();
@@ -794,17 +827,50 @@ const plugin = {
       }
     } catch (_) {}
 
-    // Workspace observer (watches route changes, childList only, no deep subtree)
+    // 1. Workspace observer (route switches)
     const mainWorkspace = document.querySelector('main[data-testid="player-workspace-main"]') || document.body;
     workspaceObserver = new MutationObserver(() => {
       triggerSync();
     });
     workspaceObserver.observe(mainWorkspace, { childList: true });
 
-    // Initial sync
+    // 2. Body portal observer (detects when Headless UI opens listbox in document.body)
+    if (window.MutationObserver) {
+      bodyPortalObserver = new MutationObserver((mutations) => {
+        for (let i = 0; i < mutations.length; i++) {
+          const m = mutations[i];
+          for (let j = 0; j < m.addedNodes.length; j++) {
+            const node = m.addedNodes[j];
+            if (node.nodeType === 1) {
+              const listbox = node.matches?.('ul[role="listbox"], [role="listbox"]')
+                ? node
+                : node.querySelector?.('ul[role="listbox"], [role="listbox"]');
+              if (listbox) {
+                enhanceListboxMenu(listbox);
+              }
+            }
+          }
+        }
+      });
+      bodyPortalObserver.observe(document.body, { childList: true });
+    }
+
+    // 3. Lightweight view polling while on playlists view (ensures button text and options are always locked)
+    syncInterval = setInterval(() => {
+      const playlistsView = document.querySelector('[data-testid="playlists-view"]');
+      if (playlistsView) {
+        const sortContainer = playlistsView.querySelector('[data-testid="sort-playlists"]');
+        if (sortContainer) {
+          updateSortButtonLabel(sortContainer);
+          attachSortButtonListeners(sortContainer);
+          checkAndInjectListboxes();
+        }
+      }
+    }, 250);
+
     syncPlaylistsView();
 
-    api.Logger?.info('[PlaylistManualSort] Playlist Manual Sort plugin active (60fps engine)');
+    api.Logger?.info('[PlaylistManualSort] Playlist Manual Sort plugin active (full portal integration)');
   },
 
   async onDisable() {
@@ -825,9 +891,19 @@ const plugin = {
       syncDebounceTimer = null;
     }
 
+    if (syncInterval) {
+      clearInterval(syncInterval);
+      syncInterval = null;
+    }
+
     if (workspaceObserver) {
       workspaceObserver.disconnect();
       workspaceObserver = null;
+    }
+
+    if (bodyPortalObserver) {
+      bodyPortalObserver.disconnect();
+      bodyPortalObserver = null;
     }
 
     if (gridObserver) {
