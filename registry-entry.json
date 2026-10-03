@@ -1,0 +1,21 @@
+{
+  "id": "nuclear-playlist-manual-sort",
+  "name": "Playlist Manual Sort",
+  "description": "Manual drag-and-drop playlist reorganization and dedicated Manual sort option for Nuclear Music Player",
+  "author": "Chad Longanecker",
+  "repo": "HuggingBunny/nuclear-playlist-manual-sort",
+  "category": "playlists",
+  "categories": [
+    "playlists"
+  ],
+  "tags": [
+    "playlists",
+    "sort",
+    "manual-sort",
+    "drag-and-drop",
+    "reorganize"
+  ],
+  "version": "1.0.0",
+  "downloadUrl": "https://github.com/HuggingBunny/nuclear-playlist-manual-sort/releases/download/v1.0.0/plugin.zip",
+  "addedAt": "2026-10-03T00:00:00Z"
+}
